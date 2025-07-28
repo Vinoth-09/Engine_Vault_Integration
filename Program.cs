@@ -1,209 +1,165 @@
 using System;
+using System.IO;
 using System.ServiceProcess;
-using System.Threading;
-using System.Threading.Tasks;
-using NLog;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Serilog;
+using Serilog.Events;
+using VaultSharp;
+using VaultSharp.V1.AuthMethods.Cert;
+using VaultService.Models;
+using VaultService.Services;
 
-namespace VaultWindowsService
+namespace VaultService
 {
-    /// <summary>
-    /// Main entry point for the Vault Windows Service
-    /// Supports both service mode and console mode for debugging
-    /// </summary>
-    static class Program
+    public static class Program
     {
-        private static readonly ILogger Logger = LogManager.GetCurrentClassLogger();
+        private static IConfiguration _configuration;
+        private static ServiceSettings _serviceSettings;
+        private static VaultSettings _vaultSettings;
+        private static LoggingSettings _loggingSettings;
 
-        /// <summary>
-        /// The main entry point for the application.
-        /// </summary>
-        static void Main(string[] args)
+        public static int Main(string[] args)
         {
             try
             {
-                // Check if running in console mode (for debugging)
-                if (Environment.UserInteractive || (args.Length > 0 && args[0].Equals("--console", StringComparison.OrdinalIgnoreCase)))
+                // Build configuration
+                _configuration = new ConfigurationBuilder()
+                    .SetBasePath(Directory.GetCurrentDirectory())
+                    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+                    .AddEnvironmentVariables()
+                    .Build();
+
+                // Bind settings
+                _serviceSettings = new ServiceSettings();
+                _configuration.GetSection("ServiceSettings").Bind(_serviceSettings);
+                
+                _vaultSettings = new VaultSettings();
+                _configuration.GetSection("VaultSettings").Bind(_vaultSettings);
+                
+                _loggingSettings = new LoggingSettings();
+                _configuration.GetSection("Logging").Bind(_loggingSettings);
+
+                // Configure logging
+                ConfigureLogging();
+
+                Log.Information("Application starting up...");
+                Log.Information("Service Name: {ServiceName}", _serviceSettings.ServiceName);
+                Log.Information("Vault Address: {VaultAddress}", _vaultSettings.VaultAddress);
+
+                // Setup DI
+                var serviceProvider = ConfigureServices();
+
+                // Run in console mode if debugger is attached or console mode is requested
+                if (Environment.UserInteractive || Debugger.IsAttached)
                 {
-                    RunAsConsole(args);
+                    Log.Information("Running in console mode");
+                    RunAsConsole(serviceProvider);
                 }
                 else
                 {
-                    RunAsService();
+                    Log.Information("Running as a Windows Service");
+                    var servicesToRun = new ServiceBase[]
+                    {
+                        serviceProvider.GetRequiredService<VaultService>()
+                    };
+                    ServiceBase.Run(servicesToRun);
                 }
+
+                return 0;
             }
             catch (Exception ex)
             {
-                Logger.Fatal(ex, "Fatal error in main program");
-                Environment.Exit(1);
+                Log.Fatal(ex, "Application terminated unexpectedly");
+                return 1;
+            }
+            finally
+            {
+                Log.CloseAndFlush();
             }
         }
 
-        /// <summary>
-        /// Runs the application as a Windows service
-        /// </summary>
-        private static void RunAsService()
+        private static IServiceProvider ConfigureServices()
         {
-            try
-            {
-                Logger.Info("Starting VaultWindowsService in service mode");
+            var services = new ServiceCollection();
 
-                ServiceBase[] ServicesToRun;
-                ServicesToRun = new ServiceBase[]
+            // Register configuration
+            services.Configure<VaultSettings>(_configuration.GetSection("VaultSettings"));
+            services.Configure<ServiceSettings>(_configuration.GetSection("ServiceSettings"));
+            services.Configure<CacheSettings>(_configuration.GetSection("CacheSettings"));
+            services.Configure<LoggingSettings>(_configuration.GetSection("Logging"));
+
+            // Register Vault client
+            services.AddSingleton<IVaultClient>(sp =>
+            {
+                var settings = new VaultClientSettings(_vaultSettings.VaultAddress, 
+                    new CertAuthMethodInfo())
                 {
-                    new VaultService()
+                    // Configure additional Vault client settings here
                 };
 
-                ServiceBase.Run(ServicesToRun);
-            }
-            catch (Exception ex)
-            {
-                Logger.Fatal(ex, "Fatal error running as Windows service");
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// Runs the application in console mode for debugging
-        /// </summary>
-        /// <param name="args">Command line arguments</param>
-        private static void RunAsConsole(string[] args)
-        {
-            try
-            {
-                Console.WriteLine("VaultWindowsService - Console Mode");
-                Console.WriteLine("==================================");
-                Console.WriteLine("Press 'Q' to quit, 'R' to force refresh, 'S' to show status");
-                Console.WriteLine();
-
-                Logger.Info("Starting VaultWindowsService in console mode");
-
-                var service = new VaultService();
-                
-                // Start the service
-                service.GetType().GetMethod("OnStart", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                    ?.Invoke(service, new object[] { args });
-
-                // Wait for user input
-                var cancellationTokenSource = new CancellationTokenSource();
-                var inputTask = Task.Run(() => HandleConsoleInput(service, cancellationTokenSource.Token));
-
-                // Wait for cancellation
-                cancellationTokenSource.Token.WaitHandle.WaitOne();
-
-                Console.WriteLine("Stopping service...");
-                
-                // Stop the service
-                service.GetType().GetMethod("OnStop", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)
-                    ?.Invoke(service, null);
-
-                Logger.Info("VaultWindowsService stopped in console mode");
-                Console.WriteLine("Service stopped. Press any key to exit.");
-                Console.ReadKey();
-            }
-            catch (Exception ex)
-            {
-                Logger.Fatal(ex, "Fatal error running in console mode");
-                Console.WriteLine($"Fatal error: {ex.Message}");
-                Console.WriteLine("Press any key to exit.");
-                Console.ReadKey();
-            }
-        }
-
-        /// <summary>
-        /// Handles console input for interactive commands
-        /// </summary>
-        /// <param name="service">Service instance</param>
-        /// <param name="cancellationToken">Cancellation token</param>
-        private static async Task HandleConsoleInput(VaultService service, CancellationToken cancellationToken)
-        {
-            try
-            {
-                while (!cancellationToken.IsCancellationRequested)
+                if (!string.IsNullOrEmpty(_vaultSettings.VaultNamespace))
                 {
-                    var key = Console.ReadKey(true);
-                    
-                    switch (char.ToUpper(key.KeyChar))
-                    {
-                        case 'Q':
-                            Console.WriteLine("Quit requested...");
-                            return;
-
-                        case 'R':
-                            Console.WriteLine("Forcing configuration refresh...");
-                            try
-                            {
-                                var result = await service.ForceConfigurationRefreshAsync();
-                                Console.WriteLine($"Refresh result: {(result ? "Success" : "Failed")}");
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Refresh error: {ex.Message}");
-                            }
-                            break;
-
-                        case 'S':
-                            Console.WriteLine("Service Status:");
-                            try
-                            {
-                                var status = service.GetServiceStatus();
-                                Console.WriteLine(Newtonsoft.Json.JsonConvert.SerializeObject(status, Newtonsoft.Json.Formatting.Indented));
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Status error: {ex.Message}");
-                            }
-                            break;
-
-                        case 'C':
-                            Console.WriteLine("Configuration Values:");
-                            try
-                            {
-                                var configs = await service.GetAllConfigurationValuesAsync();
-                                if (configs.Count > 0)
-                                {
-                                    foreach (var kvp in configs)
-                                    {
-                                        Console.WriteLine($"  {kvp.Key}: {kvp.Value}");
-                                    }
-                                }
-                                else
-                                {
-                                    Console.WriteLine("  No configuration values available");
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine($"Configuration error: {ex.Message}");
-                            }
-                            break;
-
-                        case 'H':
-                        case '?':
-                            Console.WriteLine("Available commands:");
-                            Console.WriteLine("  Q - Quit");
-                            Console.WriteLine("  R - Force refresh configuration");
-                            Console.WriteLine("  S - Show service status");
-                            Console.WriteLine("  C - Show configuration values");
-                            Console.WriteLine("  H/? - Show this help");
-                            break;
-
-                        default:
-                            // Ignore other keys
-                            break;
-                    }
-
-                    await Task.Delay(100, cancellationToken);
+                    settings.Namespace = _vaultSettings.VaultNamespace;
                 }
-            }
-            catch (OperationCanceledException)
+
+                return new VaultClient(settings);
+            });
+
+            // Register services
+            services.AddSingleton<VaultService>();
+            services.AddSingleton<IConfiguration>(_configuration);
+            services.AddSingleton(_serviceSettings);
+            services.AddSingleton(_vaultSettings);
+
+            // Add hosted services if needed
+            // services.AddHostedService<SomeBackgroundService>();
+
+            return services.BuildServiceProvider();
+        }
+
+        private static void ConfigureLogging()
+        {
+            var loggerConfiguration = new LoggerConfiguration()
+                .MinimumLevel.Debug()
+                .MinimumLevel.Override("Microsoft", LogEventLevel.Warning)
+                .Enrich.FromLogContext()
+                .WriteTo.Console(
+                    outputTemplate: _loggingSettings.Console.OutputTemplate);
+
+            if (_loggingSettings.Console.Enabled)
             {
-                // Expected when cancellation is requested
+                loggerConfiguration.WriteTo.Console(
+                    outputTemplate: _loggingSettings.Console.OutputTemplate);
             }
-            catch (Exception ex)
+
+            if (!string.IsNullOrEmpty(_loggingSettings.File.Path))
             {
-                Logger.Error(ex, "Error in console input handler");
-                Console.WriteLine($"Input handler error: {ex.Message}");
+                loggerConfiguration.WriteTo.File(
+                    _loggingSettings.File.Path,
+                    rollingInterval: Enum.Parse<RollingInterval>(_loggingSettings.File.RollingInterval),
+                    retainedFileCountLimit: _loggingSettings.File.RetainedFileCountLimit,
+                    fileSizeLimitBytes: _loggingSettings.File.FileSizeLimitBytes,
+                    outputTemplate: "[{Timestamp:HH:mm:ss} {Level:u3}] {Message:lj}{NewLine}{Exception}");
             }
+
+            Log.Logger = loggerConfiguration.CreateLogger();
+        }
+
+        private static void RunAsConsole(IServiceProvider serviceProvider)
+        {
+            Console.CancelKeyPress += (sender, e) =>
+            {
+                e.Cancel = true;
+                Log.Information("Shutting down...");
+                Environment.Exit(0);
+            };
+
+            var service = serviceProvider.GetRequiredService<VaultService>();
+            service.OnStart(Array.Empty<string>());
+
+            Console.WriteLine("Press Ctrl+C to stop the service");
+            Thread.Sleep(Timeout.Infinite);
         }
     }
 }
